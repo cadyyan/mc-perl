@@ -1,0 +1,109 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Mojo::UserAgent;
+use POE;
+use POE::Component::Client::DNS;
+use POE::Component::IRC;
+use POE::Component::IRC::Plugin::BotCommand;
+
+my @channels = ('#milwaukee-pm');
+my $dns = POE::Component::Client::DNS->spawn();
+my $irc = POE::Component::IRC->spawn(
+	nick   => 'mcperl',
+	server => 'irc.perl.org',
+);
+
+POE::Session->create(
+	package_states => [
+		main => [ qw(_start irc_001 irc_botcmd_slap irc_botcmd_lookup dns_response irc_botcmd_spit) ],
+	],
+);
+
+$poe_kernel->run();
+
+sub _start {
+	$irc->plugin_add('BotCommand', POE::Component::IRC::Plugin::BotCommand->new(
+		Commands => {
+			slap   => 'Takes one argument: a nickname to slap.',
+			lookup => 'Takes two arguments: a record type (optional), and a host.',
+			spit   => 'Spits some mad rhymes. Give it a sentence.',
+		},
+		Prefix   => '!',
+	));
+	$irc->yield(register => qw(001 botcmd_slap botcmd_lookup botcmd_spit));
+	$irc->yield(connect => { });
+}
+
+# join some channels
+sub irc_001 {
+	$irc->yield(join => $_) for @channels;
+	return;
+}
+
+sub irc_botcmd_spit {
+	my $nick  = (split /!/, $_[ARG0])[0];
+	my ($where, $arg) = @_[ARG1, ARG2];
+
+	my $ua = Mojo::UserAgent->new;
+	my $tx = $ua->post('http://www.pangloss.com/seidel/Poem/poem.cgi' =>
+		form => { name => $arg });
+
+	if (my $res = $tx->success) {
+		my $body = $res->dom;
+		my $p    = $body->find('p')->first->text(0);
+
+		my @lines = split('\n', $p);
+
+		for (@lines) {
+			$irc->yield(privmsg => $where, $_);
+		}
+	}
+
+	return;
+}
+
+# the good old slap
+sub irc_botcmd_slap {
+	my $nick = (split /!/, $_[ARG0])[0];
+	my ($where, $arg) = @_[ARG1, ARG2];
+	$irc->yield(ctcp => $where, "ACTION slaps $arg");
+	return;
+}
+
+# non-blocking dns lookup
+sub irc_botcmd_lookup {
+	my $nick = (split /!/, $_[ARG0])[0];
+	my ($where, $arg) = @_[ARG1, ARG2];
+	my ($type, $host) = $arg =~ /^(?:(\w+) )?(\S+)/;
+
+	my $res = $dns->resolve(
+		event => 'dns_response',
+		host => $host,
+		type => $type,
+		context => {
+			where => $where,
+			nick  => $nick,
+		},
+	);
+	$poe_kernel->yield(dns_response => $res) if $res;
+	return;
+}
+
+sub dns_response {
+	my $res = $_[ARG0];
+	my @answers = map { $_->rdatastr } $res->{response}->answer() if $res->{response};
+
+	$irc->yield(
+		'notice',
+		$res->{context}->{where},
+		$res->{context}->{nick} . (@answers
+			? ": @answers"
+			: ': no answers for "' . $res->{host} . '"')
+	);
+
+	return;
+}
+
